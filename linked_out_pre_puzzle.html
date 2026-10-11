@@ -109,8 +109,6 @@
   .tile.inactive.on:hover{background:rgba(0,0,0,.1)}
   .tile.inactive:focus-visible{outline:none}
 
-  .ending{position:fixed;left:50%;bottom:7vh;transform:translateX(-50%);font-size:11px;letter-spacing:5px;color:#000;opacity:0;white-space:nowrap;pointer-events:none}
-  .ending.show{animation:fadeup 1.2s .8s forwards}
   .reset{position:fixed;right:16px;bottom:14px;z-index:4;border:0;background:transparent;color:rgba(0,0,0,.45);font-size:18px;cursor:pointer;padding:8px;transition:color .2s ease, transform .2s ease}
   .reset:hover{color:#000;transform:rotate(-16deg)}
   .flash{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;z-index:4}.flash.hit{animation:flash .32s ease-out}
@@ -150,8 +148,8 @@
   @media(prefers-reduced-motion:reduce){.glitch.play,.glitch.play .glitch-scan,.glitch.play .glitch-ghost,.glitch.play .glitch-ghost-2{animation-duration:.01ms}}
 
 /* Narrative prologue and epilogue */
-body.intro .page,body.intro .coords-layer,body.intro #fx,body.intro .wash,body.intro .reset,body.intro .ending{visibility:hidden}
-body.story .page,body.story .coords-layer,body.story #fx,body.story .wash,body.story .reset,body.story .ending{visibility:hidden}
+body.intro .page,body.intro .coords-layer,body.intro #fx,body.intro .wash,body.intro .reset{visibility:hidden}
+body.story .page,body.story .coords-layer,body.story #fx,body.story .wash,body.story .reset{visibility:hidden}
 .story-layer{position:fixed;inset:0;z-index:50;display:none;overflow:hidden;background:#fff;color:#090909}
 .story-layer.show{display:grid;place-items:center}
 .story-layer.final-intro{opacity:0;transition:opacity 720ms ease-in-out}
@@ -255,7 +253,7 @@ body.game-enter .page,body.game-enter .coords-layer,body.game-enter #fx,body.gam
 </main>
 
 <button class="reset" id="reset" title="Reset current board" aria-label="Reset current board">↺</button>
-<div class="ending" id="ending">TRANSMISSION COMPLETE</div>
+
 
 
 <div id="story" class="story-layer show" aria-live="polite">
@@ -286,7 +284,7 @@ const slots=[...document.querySelectorAll('.slot')];
 const stageEl=document.getElementById('stage');
 const previousBtn=document.getElementById('previousBtn');
 const resetBtn=document.getElementById('reset');
-const ending=document.getElementById('ending');
+
 const flash=document.getElementById('flash');
 const coordEls=[...document.querySelectorAll('.coord')];
 const coordEmphasisUntil=Array(5).fill(0);
@@ -393,7 +391,6 @@ function renderToolbar(){
   previousBtn.disabled=current===0;
   previousBtn.classList.toggle('active',preview);
   resetBtn.style.opacity = preview ? '.18' : '1';
-  if(pages.every(p=>p.solved)) ending.classList.add('show'); else ending.classList.remove('show');
 }
 
 function randDigits(){
@@ -501,17 +498,22 @@ function pulseHintCell(index){
 }
 
 function manageStageOneDemo(){
-  const shouldRun=current===0 && !preview && !pages[0].solved;
+  // Stage 1 skips cells already selected correctly; stage 2 always cycles
+  // through all five solution positions, even after they have been clicked.
+  const shouldRun=(current===0 || current===1) && !preview && !pages[current].solved && !busy;
   if(!shouldRun){
     if(demoTimer!==null){clearInterval(demoTimer);demoTimer=null;}
     return;
   }
   if(demoTimer!==null) return;
+  demoStep=0;
+  const demoStage=current;
   const tick=()=>{
-    if(current!==0 || preview || pages[0].solved) return;
-    const remaining=coords.map(([r,c])=>(r-1)*N+(c-1)).filter(i=>!stageOneActiveClicks.has(i));
-    if(!remaining.length) return;
-    pulseHintCell(remaining[demoStep % remaining.length]);
+    if(current!==demoStage || preview || pages[demoStage].solved || busy) return;
+    const all=coords.map(([r,c])=>(r-1)*N+(c-1));
+    const candidates=demoStage===0 ? all.filter(i=>!stageOneActiveClicks.has(i)) : all;
+    if(!candidates.length) return;
+    pulseHintCell(candidates[demoStep % candidates.length]);
     demoStep++;
   };
   tick();
@@ -536,8 +538,12 @@ function solveCurrent(){
     const completed=current;
     const duration=durations[completed];
     playCRTGlitch(duration,intensities[completed]);
-    setTimeout(()=>{current++;preview=false;render();},Math.round(duration*.5));
-    setTimeout(()=>{busy=false;},duration+35);
+    setTimeout(()=>{
+      coordEmphasisUntil.fill(0);
+      coordEls.forEach(el=>el.classList.remove('emph'));
+      current++;preview=false;render();
+    },Math.round(duration*.5));
+    setTimeout(()=>{busy=false;manageStageOneDemo();},duration+35);
   }, 1400);
 }
 
@@ -545,11 +551,19 @@ function resetCurrent(){
   if(preview || busy) return;
   const page=pages[current];
   if(page.frozen) return;
+
+  // Reset must cancel the previous tutorial clock before rebuilding the grid.
+  // render() will start a fresh cycle and immediately show the first hint.
+  if(demoTimer!==null){clearInterval(demoTimer);demoTimer=null;}
+  demoStep=0;
+  // Old underline pulses must not leak into the newly reset puzzle.
+  coordEmphasisUntil.fill(0);
+  coordEls.forEach(el=>el.classList.remove('emph'));
+
   page.board=[...page.start];
   page.clicked.clear();
   page.solved=false;
   if(current===0) stageOneActiveClicks.clear();
-  demoStep=0;
   render();
 }
 
