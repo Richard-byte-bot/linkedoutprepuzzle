@@ -109,6 +109,7 @@
   .tile.inactive.on:hover{background:rgba(0,0,0,.1)}
   .tile.inactive:focus-visible{outline:none}
 
+  /* Change only when the screen actually inverts, not when the finale starts. */
   .reset{position:fixed;right:16px;bottom:14px;z-index:4;border:0;background:transparent;color:rgba(0,0,0,.45);font-size:18px;cursor:pointer;padding:8px;transition:color .2s ease, transform .2s ease}
   .reset:hover{color:#000;transform:rotate(-16deg)}
   .flash{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;z-index:4}.flash.hit{animation:flash .32s ease-out}
@@ -262,6 +263,252 @@ body.game-enter .page,body.game-enter .coords-layer,body.game-enter #fx,body.gam
   <div id="storyContent" class="story-dialog"><p class="story-line intro-line">Find the similarity.</p><button id="storyStart" class="story-next" aria-label="Begin"><span class="triangle" aria-hidden="true"></span></button></div>
 </div>
 <script>
+
+/* Linked-Out SFX-only: no BGM, melody loops or ambient drone; event-based audio only. */
+const audioEngine=(()=>{
+ const AC=window.AudioContext||window.webkitAudioContext;
+ let ac,master,melodyBus,scorePadBus,pad,glitchBus,redHumGain,redHumFilter,redHumSource,currentGain,currentSource,playing=false,muted=false,mode='intro',step=0,scoreStage=-1,stageStart=0,scoreTimer=null,scoreEpoch=0,glitchNoise=null,lastRedGlitch=-1;
+ const hz=n=>440*Math.pow(2,(n-69)/12);
+ // Eight four-beat measures in D minor; deliberately low, lyrical and spacious.
+ // Chord progression: Dm - Bb - F - C - Gm - Dm - Bb - A(sus) - Dm - F - Gm - Dm.
+ // A complete 32-second melody. The pulse remains steady as the lead fades after stage 2.
+ // A shorter, wistful 32-beat melody; the same theme returns one octave down in stage 0.
+ const theme=[
+   62,65,69,67, 65,62,60,58, 60,65,69,67, 64,62,60,60,
+   58,62,65,64, 62,60,57,57, 58,62,65,62, 61,64,60,57
+ ];
+ const chords=[
+   [50,53,57], [46,50,53], [53,57,60], [48,52,55],
+   [43,46,50], [50,53,57], [46,50,53], [45,50,52],
+   [50,53,57], [53,57,60], [43,46,50], [50,53,57]
+ ];
+ const bassLine=[38,34,41,36,31,38,34,33,38,41,31,38];
+ function setup(){
+  if(!AC||ac)return;
+  ac=new AC();
+  const compressor=ac.createDynamicsCompressor();
+  compressor.threshold.value=-15;compressor.ratio.value=5;compressor.attack.value=.003;compressor.release.value=.2;
+  master=ac.createGain();master.gain.value=muted?0:.82;master.connect(compressor);compressor.connect(ac.destination);
+  melodyBus=ac.createGain();melodyBus.gain.value=1;melodyBus.connect(master);
+  // Musical bed uses the SAME fade envelope as the music box.
+  scorePadBus=ac.createGain();scorePadBus.gain.value=.85;
+  const bedLow=ac.createBiquadFilter();bedLow.type='lowpass';bedLow.frequency.value=1150;bedLow.Q.value=.45;
+  scorePadBus.connect(bedLow);bedLow.connect(melodyBus);
+  glitchBus=ac.createGain();glitchBus.gain.value=1;glitchBus.connect(master);
+  // Restrained bandwidth-limited electrical hum, present only during visual breakdown.
+  // Filtered noise rather than a continuous low-frequency pure tone.
+  redHumGain=ac.createGain();redHumGain.gain.value=0;
+  redHumFilter=ac.createBiquadFilter();redHumFilter.type='bandpass';redHumFilter.frequency.value=520;redHumFilter.Q.value=.55;
+  redHumGain.connect(glitchBus);
+  redHumFilter.connect(redHumGain);
+  glitchNoise=ac.createBuffer(1,Math.floor(ac.sampleRate*.085),ac.sampleRate);
+  {const data=glitchNoise.getChannelData(0);for(let i=0;i<data.length;i++)data[i]=(Math.random()*2-1);}
+  const humBuffer=ac.createBuffer(1,Math.floor(ac.sampleRate*2),ac.sampleRate);
+  {const a=humBuffer.getChannelData(0);for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1);}
+  redHumSource=ac.createBufferSource();redHumSource.buffer=humBuffer;redHumSource.loop=true;redHumSource.connect(redHumFilter);redHumSource.start();
+  // Separate, gently crackling electrical bed. Audible only once the screen turns black.
+  currentGain=ac.createGain();currentGain.gain.value=0;currentGain.connect(master);
+  const currentHigh=ac.createBiquadFilter(),currentLow=ac.createBiquadFilter();
+  currentHigh.type='highpass';currentHigh.frequency.value=950;
+  currentLow.type='lowpass';currentLow.frequency.value=4300;
+  currentHigh.connect(currentLow);currentLow.connect(currentGain);
+  currentSource=ac.createBufferSource();currentSource.buffer=humBuffer;currentSource.loop=true;
+  currentSource.connect(currentHigh);currentSource.start();
+  pad=ac.createGain();pad.gain.value=0;
+  const hp=ac.createBiquadFilter();hp.type='highpass';hp.frequency.value=185;
+  const lp=ac.createBiquadFilter();lp.type='lowpass';lp.frequency.value=850;
+  pad.connect(hp);hp.connect(lp);lp.connect(master);
+  // Quiet, warm chords: no beating sub-bass, no continuous 80-Hz rumble.
+  for(const [f,v] of []){
+   const o=ac.createOscillator(),g=ac.createGain();o.type='sine';o.frequency.value=f;g.gain.value=v;
+   o.connect(g);g.connect(pad);o.start();
+  }
+ }
+ function unlock(){setup();if(!ac)return;ac.resume().catch(()=>{});
+  if(!playing){playing=true;mode='game';pad.gain.setValueAtTime(0,ac.currentTime);}
+ }
+ function env(g,t,d,v,attack=.012){g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.0002,v),t+attack);g.gain.exponentialRampToValueAtTime(.0001,t+d)}
+ function note(n,d=.5,vol=.06,type='sine',delay=0,end=null,destination=null){
+  if(!ac||muted)return;const t=ac.currentTime+delay,o=ac.createOscillator(),g=ac.createGain(),f=hz(n);
+  o.type=type;o.frequency.setValueAtTime(f,t);if(end)o.frequency.exponentialRampToValueAtTime(hz(end),t+d);
+  env(g,t,d,vol,Math.min(.025,d*.18));o.connect(g);g.connect(destination||master);o.start(t);o.stop(t+d+.02);
+ }
+ function hiss(d=.08,vol=.09,delay=0,cut=900){
+  if(!ac||muted)return;const t=ac.currentTime+delay,buf=ac.createBuffer(1,Math.ceil(d*ac.sampleRate),ac.sampleRate),arr=buf.getChannelData(0);
+  for(let i=0;i<arr.length;i++)arr[i]=Math.random()*2-1;
+  const src=ac.createBufferSource(),filter=ac.createBiquadFilter(),g=ac.createGain();
+  filter.type='highpass';filter.frequency.value=cut;src.buffer=buf;env(g,t,d,vol,.004);src.connect(filter);filter.connect(g);g.connect(master);src.start(t);src.stop(t+d+.02);
+ }
+ function box(n,vol=.083,delay=0,soft=false){
+  // Soft felt music box, with less glassy upper sparkle than the previous mix.
+  note(n,soft?1.9:1.38,vol,'sine',delay,null,melodyBus);
+  note(n+12,.24,vol*.075,'sine',delay+.008,null,melodyBus);
+  note(n-12,soft?1.5:.94,vol*.13,'sine',delay+.016,null,melodyBus);
+ }
+ // Sustained, harmonized atmosphere (not a detuned bass oscillator).
+ // Each 4-beat phrase has its own chord; slowly moving inner voices give continuity.
+ function scoreChord(k){
+  if(!ac||muted)return;
+  const chord=chords[Math.floor(k/4)%8];
+  const t=ac.currentTime, duration=4.35;
+  for(let i=0;i<chord.length;i++){
+   const osc=ac.createOscillator(),g=ac.createGain();
+   osc.type=i===1?'triangle':'sine';osc.frequency.value=hz(chord[i]+12);
+   const v=[.017,.014,.014][i];
+   g.gain.setValueAtTime(.0001,t);
+   g.gain.linearRampToValueAtTime(v,t+1.15);
+   g.gain.setValueAtTime(v,t+3.30);
+   g.gain.linearRampToValueAtTime(.0001,t+duration);
+   osc.connect(g);g.connect(scorePadBus);osc.start(t);osc.stop(t+duration+.04);
+  }
+  // Airy upper fifth and a gentle moving root, above the unpleasant subbass range.
+  const root=chord[0]+12;
+  note(root,3.75,.025,'sine',.12,null,scorePadBus);
+  note(root+7,3.5,.009,'sine',.35,null,scorePadBus);
+ }
+ function stopClock(){scoreEpoch++;if(scoreTimer!==null){clearTimeout(scoreTimer);scoreTimer=null;}}
+ // All five levels keep the exact same melody, beat and harmonic rhythm.
+ // Added parts use chord tones and voice-leading rather than unrelated pitches.
+ function beat(stage){
+  if(!ac||ac.state!=='running'||mode!=='game')return;
+  const k=step%theme.length, n=theme[k];
+  // One stable melody through stages 1–2. Stage 3 uses a real 10-second
+  // bus fade (including ringing tails); nothing restarts in stages 4–5.
+  if(stage<=2 && (stage!==2 || ac.currentTime-stageStart<10)){
+   box(n,.071,0,true);
+   if(k%4===0)scoreChord(k);
+  }
+  step++;
+ }
+ function freeLoop(epoch){
+  if(epoch!==scoreEpoch||mode!=='game'||scoreStage!==2)return;
+  if(ac.currentTime-stageStart>=10)return;
+  beat(scoreStage);
+  scoreTimer=setTimeout(()=>freeLoop(epoch),1000);
+ }
+ function syncStage(stage){
+  if(!ac||mode!=='game'||scoreStage===stage)return;
+  stopClock();scoreStage=stage;stageStart=ac.currentTime;
+  const t=ac.currentTime;
+  melodyBus.gain.cancelScheduledValues(t);
+  if(stage===2){
+   melodyBus.gain.setValueAtTime(melodyBus.gain.value,t);
+   melodyBus.gain.linearRampToValueAtTime(0,t+10);
+  }else if(stage>2){
+   melodyBus.gain.setValueAtTime(0,t);
+  }else{
+   melodyBus.gain.setValueAtTime(1,t);
+  }
+  // No fifth-stage hum. Only the later screen flashing starts interference.
+  currentGain.gain.cancelScheduledValues(t);currentGain.gain.setValueAtTime(0,t);
+  redHumGain.gain.cancelScheduledValues(t);
+  redHumGain.gain.setValueAtTime(0,t);
+  if(stage===2){const e=scoreEpoch;beat(stage);scoreTimer=setTimeout(()=>freeLoop(e),1000);}
+
+ }
+ function setMode(m){stopClock();mode=m;step=0;scoreStage=-1;}
+ function harmony(notes,t=0,d=.45,volume=.034,wave='triangle'){
+  notes.forEach((n,i)=>note(n,d,volume*(i===0?1:.78),wave,t+i*.008));
+ }
+ function hit(t=0,power=1){
+  hiss(.085,.13*power,t,600);
+  note(52,.22,.10*power,'triangle',t,43);
+  note(64,.21,.105*power,'sawtooth',t,58);
+  note(76,.14,.06*power,'triangle',t,69);
+ }
+ // A distinct short radio/dropout glitch for EVERY freshly spawned red word.
+ // No held oscillator or monotonically rising buzz. Shared noise sample is lightweight.
+ function redWord(index,progress){
+  if(!ac||muted||(mode!=='chaos'&&mode!=='blackout'))return;
+  // The red letters may spawn dozens per frame. Space audible glitches rather
+  // than burying them under hundreds of simultaneous, very quiet noise clicks.
+  const t=ac.currentTime;
+  if(t-lastRedGlitch<.038)return;
+  lastRedGlitch=t;
+  const src=ac.createBufferSource(),band=ac.createBiquadFilter(),v=ac.createGain();
+  src.buffer=glitchNoise;
+  band.type='bandpass';band.frequency.value=1150+(index%9)*190;band.Q.value=.78;
+  v.gain.setValueAtTime(.0001,t);
+  v.gain.linearRampToValueAtTime(.19,t+.004);
+  v.gain.exponentialRampToValueAtTime(.0001,t+.083);
+  src.connect(band);band.connect(v);v.connect(glitchBus);
+  src.start(t);src.stop(t+.084);
+  // A pitched dropout edge gives each burst more definition on small speakers.
+  const o=ac.createOscillator(),g=ac.createGain();o.type='square';
+  o.frequency.setValueAtTime(960+(index%6)*90,t);
+  o.frequency.exponentialRampToValueAtTime(190+(index%5)*32,t+.075);
+  env(g,t,.085,.060,.003);o.connect(g);g.connect(glitchBus);o.start(t);o.stop(t+.09);
+ }
+
+ function zeroLoop(epoch){
+  if(mode!=='zero'||epoch!==scoreEpoch)return;
+  if(ac&&ac.state==='running'){
+   const k=step%theme.length;
+   // Entire theme one octave lower, in a felt-like register, isolated after chaos.
+   // No bassline, chord pad, or other accumulated tracks.
+   box(theme[k]-12,.046,0,true);
+   if(k===0||k===24) note(theme[k]-24,2.2,.008,'sine',.18);
+   step++;
+  }
+  scoreTimer=setTimeout(()=>zeroLoop(epoch),1450);
+ }
+ function question(){
+  // Restrained unresolved question, not a celebratory fanfare.
+  note(62,.42,.062,'sine');note(65,.65,.054,'sine',.20);
+  note(68,1.35,.041,'sine',.43);note(57,1.55,.019,'triangle',.35);
+ }
+ return {
+  unlock,
+  stageChanged(stage){/* No background music or stage-driven loops. */},
+  hintBeat(stage){/* Visual hint only: no recurring music-box notes. */},
+  intro(){unlock();note(62,.32,.042);note(69,.48,.025,'sine',.15)},
+  press(i){unlock();const n=49+(i%5)*2+Math.floor(i/5);note(n,.12,.080,'triangle',0,n-4);note(n+12,.08,.022,'sine',.008)},
+  reset(){unlock();note(64,.17,.060,'triangle',0,55)},
+  preview(){unlock();note(71,.12,.065)},
+  solve(){unlock();[71,67,66].forEach((n,i)=>note(n,.45,.065,'sine',i*.12))},
+  glitch(p=1){unlock();hiss(.10+.04*p,.047*p);note(55,.17,.035,'triangle',0,49)},
+  finale(){unlock();setMode('finale');pad.gain.setValueAtTime(0,ac.currentTime)},
+  question(){unlock();question()},
+  invert(){unlock();hiss(.22,.055,0,850);note(67,.48,.06,'triangle',0,55);
+    // The black flash awakens a quiet, gritty electrical hiss behind the red text.
+    const t=ac.currentTime;currentGain.gain.cancelScheduledValues(t);
+    currentGain.gain.setValueAtTime(.12,t);
+  },
+  red(){unlock();hiss(.16,.065,0,900);note(69,.21,.050,'triangle',0,60)},
+  chaos(){unlock();setMode('chaos');lastRedGlitch=-1;glitchBus.gain.cancelScheduledValues(ac.currentTime);glitchBus.gain.setValueAtTime(1,ac.currentTime);pad.gain.setTargetAtTime(.0001,ac.currentTime,.3)},
+  redWord(index,progress){redWord(index,progress)},
+  interferenceStart(){unlock();if(!ac)return;const t=ac.currentTime;redHumGain.gain.cancelScheduledValues(t);redHumGain.gain.setValueAtTime(.095,t)},
+  blackout(){unlock();setMode('blackout');const t=ac.currentTime;
+   // Keep the glitch alive AFTER the image disappears: hold 0.8 seconds,
+   // then taper slowly into the black-screen silence.
+   glitchBus.gain.cancelScheduledValues(t);glitchBus.gain.setValueAtTime(glitchBus.gain.value,t);
+   glitchBus.gain.setValueAtTime(1,t+.8);glitchBus.gain.linearRampToValueAtTime(0,t+3.0);
+   currentGain.gain.cancelScheduledValues(t);currentGain.gain.setValueAtTime(currentGain.gain.value,t);
+   // Electrical static remains at full level after the screen is fully black,
+   // then fades independently of the shorter one-shot glitches.
+   currentGain.gain.setValueAtTime(currentGain.gain.value,t+2.6);
+   currentGain.gain.linearRampToValueAtTime(0,t+4.7);
+   pad.gain.setTargetAtTime(.0001,t,.28);
+  },
+  zero(){unlock();setMode('zero');currentGain.gain.setValueAtTime(0,ac.currentTime);melodyBus.gain.cancelScheduledValues(ac.currentTime);melodyBus.gain.setValueAtTime(1,ac.currentTime);redHumGain.gain.setValueAtTime(0,ac.currentTime);glitchBus.gain.setValueAtTime(1,ac.currentTime);pad.gain.setValueAtTime(0,ac.currentTime)},
+  zeroPress(){unlock();note(55,.13,.067,'triangle',0,50)},
+  zeroClear(){
+   unlock();setMode('zero-clear');
+   // Non-musical terminal unlock: precise snap, brief wideband release,
+   // then silence. No oscillator pitches or overlapping click sound.
+   hiss(.035,.19,0,1900);
+   hiss(.16,.085,.038,650);
+   hiss(.43,.018,.14,1450);
+  },
+  outro(){unlock();setMode('outro');pad.gain.setTargetAtTime(.0001,ac.currentTime,.2)},
+  fadeOut(seconds=5){if(!ac)return;stopClock();mode='silence';const t=ac.currentTime;
+   master.gain.cancelScheduledValues(t);master.gain.setValueAtTime(master.gain.value,t);
+   master.gain.linearRampToValueAtTime(0,t+seconds);
+   pad.gain.setTargetAtTime(0,t,seconds/4);
+  }
+ };
+})();
+
 const baseStages=[
   {letter:"R",start:[0,0,0,0,0,0,1,1,1,0,0,0,1,0,1,0,0,0,1,1,1,1,1,0,1],target:[1,1,1,1,0,1,0,0,0,1,1,1,1,1,0,1,0,1,0,0,1,0,0,1,0]},
   {letter:"E",start:[0,0,0,0,1,0,1,1,1,1,0,0,1,0,1,0,0,1,1,1,1,0,0,0,0],target:[1,1,1,1,1,1,0,0,0,0,1,1,1,1,0,1,0,0,0,0,1,1,1,1,1]},
@@ -459,6 +706,7 @@ function render(changed=[]){
   renderToolbar();
   renderCoords();
   manageStageOneDemo();
+  audioEngine.stageChanged(current);
 }
 
 function press(i){
@@ -468,6 +716,7 @@ function press(i){
   if(current===0 && coordIdx===-1){
     return;
   }
+  audioEngine.press(i);
   page.clicked.add(i);
   if(current===0){
     if(stageOneActiveClicks.has(i)) stageOneActiveClicks.delete(i);
@@ -495,6 +744,7 @@ function pulseHintCell(index){
   tile.classList.add('demo');
   const ci=coordIndexForCell(index);
   emphasizeCoord(ci, 700, current<=2);
+  if(current<=1)audioEngine.hintBeat(current);
 }
 
 function manageStageOneDemo(){
@@ -523,6 +773,7 @@ function manageStageOneDemo(){
 function solveCurrent(){
   if(busy) return;
   busy=true;
+  audioEngine.solve();
   const page=pages[current];
   page.solved=true;
   page.frozen=true;
@@ -537,7 +788,7 @@ function solveCurrent(){
     const intensities=[0.75,1.15,1.7,2.4];
     const completed=current;
     const duration=durations[completed];
-    playCRTGlitch(duration,intensities[completed]);
+    audioEngine.glitch(intensities[completed]);playCRTGlitch(duration,intensities[completed]);
     setTimeout(()=>{
       coordEmphasisUntil.fill(0);
       coordEls.forEach(el=>el.classList.remove('emph'));
@@ -549,6 +800,7 @@ function solveCurrent(){
 
 function resetCurrent(){
   if(preview || busy) return;
+  audioEngine.reset();
   const page=pages[current];
   if(page.frozen) return;
 
@@ -567,7 +819,7 @@ function resetCurrent(){
   render();
 }
 
-previousBtn.onclick=()=>{ if(current===0) return; preview=!preview; render(); };
+previousBtn.onclick=()=>{ if(current===0) return; audioEngine.preview(); preview=!preview; render(); };
 resetBtn.onclick=resetCurrent;
 
 coordEls.forEach((el,i)=>{
@@ -635,6 +887,7 @@ document.body.classList.add('intro');
 function wait(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
 document.getElementById('storyStart').onclick=()=>{
  if(storyState!=='intro')return;
+ audioEngine.intro();
  storyState='game';document.body.classList.remove('intro');document.body.classList.add('game-enter');
  story.classList.add('intro-exit');
  setTimeout(()=>{story.classList.remove('show','intro-exit');document.body.classList.remove('game-enter');},950);
@@ -668,7 +921,7 @@ async function beginFinale(){
  if(storyState!=='game')return;
  const slotsBefore=[...document.querySelectorAll('.readout .slot')];
  const from=slotsBefore.map(el=>{const r=el.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,text:el.textContent.trim()}});
- storyState='finale';
+ storyState='finale';audioEngine.finale();
  story.className='story-layer show final-intro';
  storyContent.innerHTML='<div class="reply-question-group"><div class="story-question" id="replyQuestion">What is the meaning of this</div><div class="reply-answer-line"><span class="story-reply" id="movingReply"><span>R</span><span>E</span><span>P</span><span>L</span><span>Y</span></span><span class="reply-questionmark" id="replyQuestionMark">?</span></div></div>';
  const reply=document.getElementById('movingReply');
@@ -689,28 +942,29 @@ async function beginFinale(){
  document.getElementById('replyQuestion')?.classList.add('visible');
  await wait(580);
  document.getElementById('replyQuestionMark')?.classList.add('visible');
+ audioEngine.question();
  await wait(1200);
  // Reverse the whole screen FIRST; keep REPLY white and legible on black.
- story.classList.add('fade-to-black','night');
+ audioEngine.invert();story.classList.add('fade-to-black','night');document.body.classList.add('audio-dark-ui');
  await wait(680);
  // Only after the inversion settles does the central word turn red.
- reply.classList.add('blood');
- await wait(690);
- storyInterference(1650,1.65);
- await wait(330);
+ audioEngine.red();reply.classList.add('blood');
+ await wait(240);
+ audioEngine.interferenceStart();storyInterference(1650,1.65);
+ await wait(120);
  echoLayer.replaceChildren();
  // Flood the screen with NEW transmissions. Old ones are replaced rather than inflated.
  // Small and readable first, with later arrivals increasingly large.
  const echoes=[];
  let phase=0;
  let nextEcho=0;
- echoLayer.classList.add('visible');
+ audioEngine.chaos();echoLayer.classList.add('visible');
  const noisy=setInterval(()=>{
    phase++;
-   const elapsed=phase*18;
-   const progress=Math.min(1,elapsed/1450);
+   const elapsed=phase*12;
+   const progress=Math.min(1,elapsed/900);
    // A fast exponential-feeling increase in the number of messages, not their size.
-   const batch=Math.min(19, 2+Math.floor(progress*progress*17));
+   const batch=Math.min(5,1+Math.floor(progress*4));
    for(let j=0;j<batch;j++){
      const i=nextEcho++;
      const d=document.createElement('div');
@@ -725,6 +979,7 @@ async function beginFinale(){
      d.style.opacity='1';
      echoLayer.appendChild(d);
      echoes.push(d);
+     audioEngine.redWord(i,progress);
    }
    const maxAge=14+Math.floor(progress*12);
    while(echoes.length && phase-Number(echoes[0].dataset.born)>maxAge){
@@ -742,13 +997,15 @@ async function beginFinale(){
      // Earlier words may disappear, allowing a more overwhelming fresh wave.
      d.style.opacity=age>maxAge-4 ? String(Math.max(0,(maxAge-age)/4)) : '';
    }
- },18);
- storyInterference(3900,1.75);
- await wait(1050);
+ },12);
+ storyInterference(3100,1.75);
+ await wait(920);
  // Keep the flicker and accumulating words alive DURING the fade.
  const curtain=document.createElement('div');curtain.id='blackCurtain';story.append(curtain);
- void curtain.offsetWidth;curtain.classList.add('closing');
+ audioEngine.blackout();void curtain.offsetWidth;curtain.classList.add('closing');
  await wait(2150);
+ // Blackout is visually complete, but the interference persists briefly.
+ await wait(850);
  clearInterval(noisy);
  cancelAnimationFrame(shaderId);storyShader.classList.remove('active');narrativeCtx.clearRect(0,0,storyShader.width,storyShader.height);
  echoLayer.classList.remove('visible');echoLayer.replaceChildren();
@@ -799,14 +1056,17 @@ function zeroDraw(){
    zeroPressLocal(zeroBoard,r,c);
    // Original zero stage: pressing bottom row flips the next level's top row, same column.
    if(r===5 && zeroPreviewRow[c]!==2) zeroPreviewRow[c]^=1;
+   const justCleared=zeroCleared(zeroBoard);
+   // Don't overlay the regular click tone on the final release.
+   if(!justCleared)audioEngine.zeroPress();
    zeroDraw();zeroDrawPreview();
-   if(zeroCleared(zeroBoard))finishZero();
+   if(justCleared)finishZero();
   };
   grid.append(tile);
  }));
 }
 function startZeroScene(){
- storyState='zero';zeroRunning=false;zeroFinished=false;
+ audioEngine.zero();storyState='zero';zeroRunning=false;zeroFinished=false;
  cancelAnimationFrame(shaderId);storyShader.classList.remove('active');
  story.classList.remove('zero-ready');story.classList.add('zero-loading');
  zeroBoard=ZERO_ORIGINAL.map(row=>row.slice());zeroPreviewRow=ZERO_PREVIEW_START.slice();zeroLastHit=null;
@@ -819,7 +1079,7 @@ function startZeroScene(){
  }));
 }
 async function finishZero(){
- zeroFinished=true;zeroRunning=false;
+ audioEngine.zeroClear();zeroFinished=true;zeroRunning=false;
  const whiteFlash=document.createElement('div');whiteFlash.id='endWhiteFlash';story.append(whiteFlash);
  const zeroStage=document.querySelector('.zero-stage-layout');
  if(zeroStage)zeroStage.style.transition='opacity .6s ease';
@@ -830,6 +1090,9 @@ async function finishZero(){
  whiteFlash.remove();
  storyContent.innerHTML='<div class="outro-copy" id="outroCopy">COMING S∞N<small>2026/10/13</small><small class="club">APHS Deduction Club</small></div>';
  document.getElementById('outroCopy').classList.add('show');
+ document.body.classList.add('audio-outro');
+ // Let the final release resonate under the title, then fade into silence.
+ setTimeout(()=>audioEngine.fadeOut(5.2),650);
  storyState='outro';
 }
 </script>
